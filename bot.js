@@ -38,6 +38,7 @@ const userScreenshots = new Map();
 client.once('ready', () => {
     console.log(`✅ Бот ${client.user.tag} запущен!`);
     console.log(`📨 Заявки будут приходить к <@${YOUR_USER_ID}>`);
+    console.log(`💰 Максимальная сумма запроса: 100 000 ₽`);
 });
 
 // Команда !form
@@ -52,7 +53,6 @@ client.on('messageCreate', async (message) => {
                 .setStyle(ButtonStyle.Primary)
         );
 
-        // Отправляем в канал (это сообщение видно всем, но оно одно)
         await message.channel.send({
             content: 'Нажми на кнопку, чтобы заполнить заявку:',
             components: [button]
@@ -71,9 +71,9 @@ client.on('interactionCreate', async (interaction) => {
 
     const amountInput = new TextInputBuilder()
         .setCustomId('amount')
-        .setLabel('Сколько денег вам требуется?')
+        .setLabel('Сколько денег вам требуется? (до 100 000 ₽)')  // ⚠️ ПРЕДУПРЕЖДЕНИЕ В ЛЕЙБЛЕ
         .setStyle(TextInputStyle.Short)
-        .setPlaceholder('Например: 50 000 ₽')
+        .setPlaceholder('Например: 50 000 ₽ (максимум 100 000 ₽)')  // ⚠️ ПРЕДУПРЕЖДЕНИЕ В ПЛЕЙСХОЛДЕРЕ
         .setRequired(true);
 
     const currentMoneyInput = new TextInputBuilder()
@@ -104,15 +104,32 @@ client.on('interactionCreate', async (interaction) => {
     if (!interaction.isModalSubmit()) return;
     if (!interaction.customId.startsWith('money_form_')) return;
 
-    const amount = interaction.fields.getTextInputValue('amount');
+    const amountRaw = interaction.fields.getTextInputValue('amount');
     const currentMoney = interaction.fields.getTextInputValue('current_money');
     const reason = interaction.fields.getTextInputValue('reason');
     const userName = interaction.user.tag;
     const userId = interaction.user.id;
 
+    // 🔥 ПРОВЕРКА: сумма не должна превышать 100 000
+    const amountNumber = parseInt(amountRaw.replace(/[^\d-]/g, ''), 10);
+    
+    if (isNaN(amountNumber) || amountNumber > 100000) {
+        return interaction.reply({
+            content: `❌ **Ошибка!**\n\nСумма запроса не может превышать **100 000 ₽**.\n\nВы указали: ${amountRaw}\n\n⚠️ **Напоминание:** Максимальная сумма для одной заявки — **100 000 ₽**.\n\nПожалуйста, начните заново с команды \`!form\` и укажите корректную сумму.`,
+            ephemeral: true
+        });
+    }
+    
+    if (amountNumber <= 0) {
+        return interaction.reply({
+            content: `❌ **Ошибка!**\n\nСумма должна быть положительным числом.\n\nВы указали: ${amountRaw}\n\nПожалуйста, начните заново с команды \`!form\`.`,
+            ephemeral: true
+        });
+    }
+
     // Сохраняем данные заявки для последующего добавления скриншота
     userScreenshots.set(userId, {
-        amount,
+        amount: amountRaw,
         currentMoney,
         reason,
         userName,
@@ -128,9 +145,9 @@ client.on('interactionCreate', async (interaction) => {
     );
 
     await interaction.reply({
-        content: `✅ **Часть 1/2 заполнена!**\n\n📝 Сумма: **${amount}**\n💰 Текущие средства: **${currentMoney}**\n❓ Причина: ${reason}\n\n**Теперь отправьте скриншот ваших средств** (баланс в игре, кошелек и т.д.)\n\nНажмите на кнопку ниже, чтобы прикрепить изображение:`,
+        content: `✅ **Часть 1/2 заполнена!**\n\n📝 Сумма: **${amountRaw}**\n💰 Текущие средства: **${currentMoney}**\n❓ Причина: ${reason}\n\n**Теперь отправьте скриншот ваших средств** (баланс в игре, кошелек и т.д.)\n\nНажмите на кнопку ниже, чтобы прикрепить изображение:`,
         components: [row],
-        ephemeral: true  // 👈 ТОЛЬКО ДЛЯ ПОЛЬЗОВАТЕЛЯ
+        ephemeral: true
     });
 });
 
@@ -216,7 +233,7 @@ client.on('messageCreate', async (message) => {
         )
         .setImage(screenshot.url)
         .setTimestamp()
-        .setFooter({ text: 'Заявка из формы | Требуется подтверждение' });
+        .setFooter({ text: 'Заявка из формы | Требуется подтверждение | Максимум 100 000 ₽' });
     
     // Кнопки для ответа
     const row = new ActionRowBuilder().addComponents(
@@ -251,7 +268,7 @@ client.on('messageCreate', async (message) => {
         if (guild) {
             const channel = guild.channels.cache.find(ch => ch.name === 'заявки' || ch.name === 'tickets');
             if (channel) {
-                await channel.send(`📨 **Новая заявка** от <@${userId}> отправлена на рассмотрение.`);
+                await channel.send(`📨 **Новая заявка** от <@${userId}> на сумму ${formData.amount} отправлена на рассмотрение.`);
             }
         }
         
