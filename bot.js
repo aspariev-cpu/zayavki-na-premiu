@@ -78,19 +78,61 @@ function getBlacklistReason(userId) {
     return entry ? entry.reason : null;
 }
 
-// Добавление в чёрный список
-function addToBlacklist(userId, reason) {
+// Добавление в чёрный список (с отправкой ЛС пользователю)
+async function addToBlacklist(userId, reason, client) {
     blacklist.set(userId, {
         reason: reason || 'Не указана',
         date: new Date().toISOString()
     });
     saveBlacklist();
+    
+    // Отправляем ЛС пользователю о блокировке
+    try {
+        const user = await client.users.fetch(userId);
+        const embed = new EmbedBuilder()
+            .setTitle('⚠️ Вы добавлены в чёрный список')
+            .setColor(0xFF0000)
+            .setDescription('Ваши действия нарушили правила, и вы были заблокированы.')
+            .addFields(
+                { name: '📝 Причина', value: reason || 'Не указана', inline: false },
+                { name: '📅 Дата блокировки', value: new Date().toLocaleString('ru-RU'), inline: false },
+                { name: '❓ Что делать?', value: 'Если вы считаете это ошибкой, обратитесь к администратору.', inline: false }
+            )
+            .setFooter({ text: 'Чёрный список | Заявки временно недоступны' });
+        
+        await user.send({ embeds: [embed] });
+        console.log(`📨 Отправлено ЛС пользователю ${userId} о блокировке`);
+    } catch (error) {
+        console.log(`❌ Не удалось отправить ЛС пользователю ${userId}:`, error.message);
+    }
 }
 
-// Удаление из чёрного списка
-function removeFromBlacklist(userId) {
+// Удаление из чёрного списка (с отправкой ЛС пользователю)
+async function removeFromBlacklist(userId, client) {
+    const userData = blacklist.get(userId);
     blacklist.delete(userId);
     saveBlacklist();
+    
+    // Отправляем ЛС пользователю о разблокировке
+    if (userData) {
+        try {
+            const user = await client.users.fetch(userId);
+            const embed = new EmbedBuilder()
+                .setTitle('✅ Вы удалены из чёрного списка')
+                .setColor(0x00FF00)
+                .setDescription('Ваша блокировка снята!')
+                .addFields(
+                    { name: '📅 Дата разблокировки', value: new Date().toLocaleString('ru-RU'), inline: false },
+                    { name: '✅ Что теперь?', value: 'Теперь вы снова можете отправлять заявки через команду `!form`', inline: false }
+                )
+                .setFooter({ text: 'Добро пожаловать обратно!' });
+            
+            await user.send({ embeds: [embed] });
+            console.log(`📨 Отправлено ЛС пользователю ${userId} о разблокировке`);
+        } catch (error) {
+            console.log(`❌ Не удалось отправить ЛС пользователю ${userId}:`, error.message);
+        }
+    }
 }
 
 client.once('ready', () => {
@@ -107,23 +149,26 @@ client.on('messageCreate', async (message) => {
     // КОМАНДЫ ДЛЯ РАБОТЫ С ЧЁРНЫМ СПИСКОМ (только для владельца)
     if (message.author.id === YOUR_USER_ID) {
         
-        // ПОМОЩЬ: !чс помощь
+        // ПОМОЩЬ: !чс помощь (ЭФЕМЕРНОЕ - удалится через 15 секунд)
         if (message.content === '!чс помощь' || message.content === '!чс хелп') {
             const embed = new EmbedBuilder()
                 .setTitle('📋 Управление чёрным списком')
                 .setColor(0xFF0000)
                 .addFields(
-                    { name: '!чс добавить @user причина', value: '➕ Добавить пользователя в чёрный список', inline: false },
-                    { name: '!чс удалить @user', value: '➖ Удалить пользователя из чёрного списка', inline: false },
+                    { name: '!чс добавить @user причина', value: '➕ Добавить пользователя в чёрный список (придёт ЛС)', inline: false },
+                    { name: '!чс удалить @user', value: '➖ Удалить пользователя из чёрного списка (придёт ЛС)', inline: false },
                     { name: '!чс список', value: '📋 Показать всех заблокированных пользователей', inline: false },
                     { name: '!чс проверить @user', value: '🔍 Проверить, в чёрном ли списке пользователь', inline: false },
                     { name: '!чс очистить', value: '🗑️ Очистить весь чёрный список (с подтверждением)', inline: false }
                 )
-                .setFooter({ text: 'Только для владельца бота' });
-            return message.reply({ embeds: [embed] });
+                .setFooter({ text: 'Только для владельца бота | Сообщение исчезнет через 15 секунд' });
+            
+            const reply = await message.reply({ embeds: [embed] });
+            setTimeout(() => reply.delete().catch(() => {}), 15000);
+            return message.delete().catch(() => {});
         }
         
-        // ДОБАВИТЬ: !чс добавить @user причина
+        // ДОБАВИТЬ: !чс добавить @user причина (ЭФЕМЕРНОЕ)
         if (message.content.startsWith('!чс добавить')) {
             const args = message.content.split(' ');
             const mention = args[2];
@@ -131,39 +176,53 @@ client.on('messageCreate', async (message) => {
             const reason = args.slice(3).join(' ') || 'Не указана';
             
             if (!userId) {
-                return message.reply('❌ **Как использовать:**\n`!чс добавить @пользователь причина блокировки`\n\nПример: `!чс добавить @Вася Спам заявками`');
+                const reply = await message.reply('❌ **Как использовать:**\n`!чс добавить @пользователь причина блокировки`\n\nПример: `!чс добавить @Вася Спам заявками`');
+                setTimeout(() => reply.delete().catch(() => {}), 10000);
+                return message.delete().catch(() => {});
             }
             
             if (isBlacklisted(userId)) {
-                return message.reply(`⚠️ Пользователь <@${userId}> **УЖЕ** в чёрном списке!`);
+                const reply = await message.reply(`⚠️ Пользователь <@${userId}> **УЖЕ** в чёрном списке!`);
+                setTimeout(() => reply.delete().catch(() => {}), 10000);
+                return message.delete().catch(() => {});
             }
             
-            addToBlacklist(userId, reason);
-            return message.reply(`✅ **Пользователь добавлен в чёрный список!**\n\n👤 Пользователь: <@${userId}>\n📝 Причина: ${reason}`);
+            await addToBlacklist(userId, reason, client);
+            const reply = await message.reply(`✅ **Пользователь добавлен в чёрный список!**\n\n👤 Пользователь: <@${userId}>\n📝 Причина: ${reason}\n📨 Ему отправлено уведомление в ЛС.`);
+            setTimeout(() => reply.delete().catch(() => {}), 15000);
+            return message.delete().catch(() => {});
         }
         
-        // УДАЛИТЬ: !чс удалить @user
+        // УДАЛИТЬ: !чс удалить @user (ЭФЕМЕРНОЕ)
         if (message.content.startsWith('!чс удалить')) {
             const args = message.content.split(' ');
             const mention = args[2];
             const userId = mention ? mention.replace(/[<@!>]/g, '') : null;
             
             if (!userId) {
-                return message.reply('❌ **Как использовать:**\n`!чс удалить @пользователь`\n\nПример: `!чс удалить @Вася`');
+                const reply = await message.reply('❌ **Как использовать:**\n`!чс удалить @пользователь`\n\nПример: `!чс удалить @Вася`');
+                setTimeout(() => reply.delete().catch(() => {}), 10000);
+                return message.delete().catch(() => {});
             }
             
             if (!isBlacklisted(userId)) {
-                return message.reply(`⚠️ Пользователь <@${userId}> **НЕ** в чёрном списке!`);
+                const reply = await message.reply(`⚠️ Пользователь <@${userId}> **НЕ** в чёрном списке!`);
+                setTimeout(() => reply.delete().catch(() => {}), 10000);
+                return message.delete().catch(() => {});
             }
             
-            removeFromBlacklist(userId);
-            return message.reply(`✅ **Пользователь удалён из чёрного списка!**\n\n👤 Пользователь: <@${userId}>`);
+            await removeFromBlacklist(userId, client);
+            const reply = await message.reply(`✅ **Пользователь удалён из чёрного списка!**\n\n👤 Пользователь: <@${userId}>\n📨 Ему отправлено уведомление в ЛС.`);
+            setTimeout(() => reply.delete().catch(() => {}), 15000);
+            return message.delete().catch(() => {});
         }
         
-        // СПИСОК: !чс список
+        // СПИСОК: !чс список (ЭФЕМЕРНОЕ)
         if (message.content === '!чс список') {
             if (blacklist.size === 0) {
-                return message.reply('📋 **Чёрный список пуст.**\n\nВсе пользователи могут отправлять заявки.');
+                const reply = await message.reply('📋 **Чёрный список пуст.**\n\nВсе пользователи могут отправлять заявки.');
+                setTimeout(() => reply.delete().catch(() => {}), 15000);
+                return message.delete().catch(() => {});
             }
             
             const list = Array.from(blacklist.entries()).map(([id, data], index) => {
@@ -176,19 +235,24 @@ client.on('messageCreate', async (message) => {
                 .setDescription(list)
                 .setTimestamp();
             
-            return message.reply({ embeds: [embed] });
+            const reply = await message.reply({ embeds: [embed] });
+            setTimeout(() => reply.delete().catch(() => {}), 30000);
+            return message.delete().catch(() => {});
         }
         
-        // ПРОВЕРИТЬ: !чс проверить @user
+        // ПРОВЕРИТЬ: !чс проверить @user (ЭФЕМЕРНОЕ)
         if (message.content.startsWith('!чс проверить')) {
             const args = message.content.split(' ');
             const mention = args[2];
             const userId = mention ? mention.replace(/[<@!>]/g, '') : null;
             
             if (!userId) {
-                return message.reply('❌ **Как использовать:**\n`!чс проверить @пользователь`\n\nПример: `!чс проверить @Вася`');
+                const reply = await message.reply('❌ **Как использовать:**\n`!чс проверить @пользователь`\n\nПример: `!чс проверить @Вася`');
+                setTimeout(() => reply.delete().catch(() => {}), 10000);
+                return message.delete().catch(() => {});
             }
             
+            let reply;
             if (isBlacklisted(userId)) {
                 const reason = getBlacklistReason(userId);
                 const embed = new EmbedBuilder()
@@ -199,20 +263,24 @@ client.on('messageCreate', async (message) => {
                         { name: '📝 Причина', value: reason, inline: true },
                         { name: '📅 Дата блокировки', value: new Date(blacklist.get(userId).date).toLocaleString('ru-RU'), inline: false }
                     );
-                return message.reply({ embeds: [embed] });
+                reply = await message.reply({ embeds: [embed] });
             } else {
                 const embed = new EmbedBuilder()
                     .setTitle('✅ ПОЛЬЗОВАТЕЛЬ НЕ В ЧЁРНОМ СПИСКЕ')
                     .setColor(0x00FF00)
                     .setDescription(`Пользователь <@${userId}> может отправлять заявки.`);
-                return message.reply({ embeds: [embed] });
+                reply = await message.reply({ embeds: [embed] });
             }
+            setTimeout(() => reply.delete().catch(() => {}), 15000);
+            return message.delete().catch(() => {});
         }
         
-        // ОЧИСТИТЬ: !чс очистить
+        // ОЧИСТИТЬ: !чс очистить (с кнопками)
         if (message.content === '!чс очистить') {
             if (blacklist.size === 0) {
-                return message.reply('📋 Чёрный список и так пуст.');
+                const reply = await message.reply('📋 Чёрный список и так пуст.');
+                setTimeout(() => reply.delete().catch(() => {}), 10000);
+                return message.delete().catch(() => {});
             }
             
             const row = new ActionRowBuilder().addComponents(
@@ -226,10 +294,16 @@ client.on('messageCreate', async (message) => {
                     .setStyle(ButtonStyle.Secondary)
             );
             
-            await message.reply({
+            const reply = await message.reply({
                 content: `⚠️ **ВНИМАНИЕ!** Вы собираетесь очистить весь чёрный список (${blacklist.size} пользователей).\n\nЭто действие нельзя отменить!`,
                 components: [row]
             });
+            
+            // Удаляем команду пользователя
+            await message.delete().catch(() => {});
+            
+            // Удаляем сообщение с кнопками через 30 секунд
+            setTimeout(() => reply.delete().catch(() => {}), 30000);
         }
     }
     
@@ -238,9 +312,11 @@ client.on('messageCreate', async (message) => {
         // Проверка чёрного списка
         if (isBlacklisted(message.author.id)) {
             const reason = getBlacklistReason(message.author.id);
-            return message.reply({
+            const reply = await message.reply({
                 content: `⚠️ **Вы в чёрном списке!**\n\n📝 Причина: ${reason}\n\nОбратитесь к администратору для снятия блокировки.`
             });
+            setTimeout(() => reply.delete().catch(() => {}), 15000);
+            return message.delete().catch(() => {});
         }
         
         const button = new ActionRowBuilder().addComponents(
@@ -254,6 +330,9 @@ client.on('messageCreate', async (message) => {
             content: 'Нажми на кнопку, чтобы заполнить заявку:',
             components: [button]
         });
+        
+        // Удаляем команду пользователя
+        await message.delete().catch(() => {});
     }
 });
 
@@ -263,13 +342,35 @@ client.on('interactionCreate', async (interaction) => {
     
     if (interaction.customId === 'clear_blacklist_confirm') {
         const count = blacklist.size;
+        
+        // Отправляем ЛС всем заблокированным о разблокировке
+        for (const [userId] of blacklist) {
+            try {
+                const user = await client.users.fetch(userId);
+                const embed = new EmbedBuilder()
+                    .setTitle('✅ Чёрный список очищен')
+                    .setColor(0x00FF00)
+                    .setDescription('Администратор очистил весь чёрный список!')
+                    .addFields(
+                        { name: '📅 Дата разблокировки', value: new Date().toLocaleString('ru-RU'), inline: false },
+                        { name: '✅ Что теперь?', value: 'Теперь вы снова можете отправлять заявки через команду `!form`', inline: false }
+                    );
+                await user.send({ embeds: [embed] });
+            } catch (error) {
+                console.log(`❌ Не удалось отправить ЛС пользователю ${userId}:`, error.message);
+            }
+        }
+        
         blacklist.clear();
         saveBlacklist();
         
         await interaction.update({
-            content: `✅ **Чёрный список очищен!** Удалено ${count} пользователей.`,
+            content: `✅ **Чёрный список очищен!** Удалено ${count} пользователей. Им отправлены уведомления в ЛС.`,
             components: []
         });
+        
+        // Удаляем сообщение через 10 секунд
+        setTimeout(() => interaction.deleteReply().catch(() => {}), 10000);
     }
     
     if (interaction.customId === 'clear_blacklist_cancel') {
@@ -277,9 +378,11 @@ client.on('interactionCreate', async (interaction) => {
             content: `❌ Очистка чёрного списка отменена.`,
             components: []
         });
+        setTimeout(() => interaction.deleteReply().catch(() => {}), 5000);
     }
 });
 
+// Остальной код (форма, скриншоты, кнопки) остаётся без изменений
 // Обработка кнопки открытия формы
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
