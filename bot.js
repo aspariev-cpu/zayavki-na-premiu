@@ -1,8 +1,9 @@
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
 require('dotenv').config();
 
-// ПРОВЕРКА ТОКЕНА ПЕРЕД ЗАПУСКОМ
+// ========== ПРОВЕРКА ТОКЕНА ==========
 console.log('🔍 Проверка конфигурации...');
 console.log('Token loaded:', process.env.DISCORD_TOKEN ? '✅ Да' : '❌ НЕТ');
 console.log('Owner ID loaded:', process.env.OWNER_ID ? '✅ Да' : '❌ НЕТ');
@@ -21,6 +22,7 @@ if (!process.env.OWNER_ID) {
     process.exit(1);
 }
 
+// ========== НАСТРОЙКИ ==========
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -33,22 +35,208 @@ const client = new Client({
 const TOKEN = process.env.DISCORD_TOKEN;
 const YOUR_USER_ID = process.env.OWNER_ID;
 
-// Хранилище временных данных для скриншотов
-const userScreenshots = new Map();
+// ID каналов и ролей
+const CHANNEL_CREATE_GATHERING = '1511716864714342561';
+const CHANNEL_GATHERING_ANNOUNCE = '1465836228875391026';
+const CHANNEL_MODERATION = '1511716991864668241';
+const HIGH_ROLE_ID = '1502022986499362976';
 
-// ЧЁРНЫЙ СПИСОК: { userId: { reason: string, date: string } }
+// ========== БАЗА ДАННЫХ ==========
+const db = new sqlite3.Database('./data.db');
+
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS player_points (
+        user_id TEXT PRIMARY KEY,
+        points INTEGER DEFAULT 0,
+        username TEXT,
+        last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    db.run(`CREATE TABLE IF NOT EXISTS gatherings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        points INTEGER,
+        organizer_id TEXT,
+        message_id TEXT,
+        channel_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        is_active BOOLEAN DEFAULT 1
+    )`);
+    
+    db.run(`CREATE TABLE IF NOT EXISTS screenshot_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        gathering_id INTEGER,
+        user_id TEXT,
+        screenshot_url TEXT,
+        comment TEXT,
+        status TEXT DEFAULT 'pending',
+        reviewed_by TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    db.run(`CREATE TABLE IF NOT EXISTS milestone_notified (
+        user_id TEXT,
+        milestone INTEGER,
+        notified_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, milestone)
+    )`);
+    
+    db.run(`CREATE TABLE IF NOT EXISTS milestone_drop_notified (
+        user_id TEXT,
+        milestone INTEGER,
+        notified_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, milestone)
+    )`);
+    
+    db.run(`CREATE TABLE IF NOT EXISTS points_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT,
+        change INTEGER,
+        new_points INTEGER,
+        reason TEXT,
+        moderator_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    console.log('✅ База данных инициализирована');
+});
+
+// ========== ФУНКЦИИ ДЛЯ БАЛЛОВ ==========
+function getUserPoints(userId, callback) {
+    db.get('SELECT points FROM player_points WHERE user_id = ?', [userId], (err, row) => {
+        if (err) {
+            console.error('Ошибка получения баллов:', err);
+            callback(0);
+        } else {
+            callback(row ? row.points : 0);
+        }
+    });
+}
+
+function addPoints(userId, points, username, callback) {
+    db.run(`INSERT INTO player_points (user_id, points, username) 
+            VALUES (?, ?, ?) 
+            ON CONFLICT(user_id) DO UPDATE SET 
+            points = points + ?, 
+            username = ?,
+            last_updated = CURRENT_TIMESTAMP`,
+            [userId, points, username, points, username], 
+            function(err) {
+                if (err) {
+                    console.error('Ошибка начисления баллов:', err);
+                    if (callback) callback(false);
+                } else {
+                    if (callback) callback(true);
+                    checkMilestone(userId, username);
+                }
+            });
+}
+
+function removePoints(userId, points, username, callback) {
+    db.get('SELECT points FROM player_points WHERE user_id = ?', [userId], (err, row) => {
+        const currentPoints = row ? row.points : 0;
+        const newPoints = Math.max(0, currentPoints - points);
+        
+        db.run(`INSERT INTO player_points (user_id, points, username) 
+                VALUES (?, ?, ?) 
+                ON CONFLICT(user_id) DO UPDATE SET 
+                points = ?, 
+                username = ?,
+                last_updated = CURRENT_TIMESTAMP`,
+                [userId, newPoints, username, newPoints, username], 
+                function(err) {
+                    if (err) {
+                        console.error('Ошибка списания баллов:', err);
+                        if (callback) callback(false);
+                    } else {
+                        if (callback) callback(true, currentPoints, newPoints);
+                        checkMilestoneDrop(userId, username, currentPoints, newPoints);
+                    }
+                });
+    });
+}
+
+function logPointsHistory(userId, change, newPoints, reason, moderatorId) {
+    db.run(`INSERT INTO points_history (user_id, change, new_points, reason, moderator_id) 
+            VALUES (?, ?, ?, ?, ?)`, [userId, change, newPoints, reason, moderatorId], (err) => {
+        if (err) console.error('Ошибка записи истории:', err);
+    });
+}
+
+async function checkMilestone(userId, username) {
+    getUserPoints(userId, async (points) => {
+        if (points >= 1000) {
+            db.get('SELECT * FROM milestone_notified WHERE user_id = ? AND milestone = 1000', [userId], async (err, row) => {
+                if (!row) {
+                    const channel = await client.channels.fetch(CHANNEL_MODERATION).catch(() => null);
+                    if (channel) {
+                        const embed = new EmbedBuilder()
+                            .setTitle('🏆 ДОСТИЖЕНИЕ 1000 БАЛЛОВ!')
+                            .setColor(0xFFA500)
+                            .setDescription(`Игрок ${username} (<@${userId}>) достиг **1000 баллов**!`)
+                            .addFields(
+                                { name: '📊 Текущие баллы', value: `${points}`, inline: true },
+                                { name: '👑 Требуется действие', value: `Выдайте ему роль МЭЙН вручную`, inline: true }
+                            )
+                            .setTimestamp();
+                        
+                        await channel.send({ 
+                            content: `<@&${HIGH_ROLE_ID}>`, 
+                            embeds: [embed] 
+                        });
+                        
+                        db.run('INSERT INTO milestone_notified (user_id, milestone) VALUES (?, ?)', [userId, 1000]);
+                    }
+                }
+            });
+        }
+    });
+}
+
+async function checkMilestoneDrop(userId, username, oldPoints, newPoints) {
+    if (oldPoints >= 1000 && newPoints < 1000) {
+        db.get('SELECT * FROM milestone_drop_notified WHERE user_id = ? AND milestone = 1000', [userId], async (err, row) => {
+            if (!row) {
+                const channel = await client.channels.fetch(CHANNEL_MODERATION).catch(() => null);
+                if (channel) {
+                    const embed = new EmbedBuilder()
+                        .setTitle('⚠️ ПОТЕРЯ РАНГА МЭЙН')
+                        .setColor(0xFF0000)
+                        .setDescription(`Игрок ${username} (<@${userId}>) **потерял ранг МЭЙН**!`)
+                        .addFields(
+                            { name: '📊 Было баллов', value: `${oldPoints}`, inline: true },
+                            { name: '📉 Стало баллов', value: `${newPoints}`, inline: true },
+                            { name: '👑 Требуется действие', value: `Снимите с него роль МЭЙН вручную`, inline: false }
+                        )
+                        .setTimestamp();
+                    
+                    await channel.send({ 
+                        content: `<@&${HIGH_ROLE_ID}>`, 
+                        embeds: [embed] 
+                    });
+                    
+                    db.run('INSERT INTO milestone_drop_notified (user_id, milestone) VALUES (?, ?)', [userId, 1000]);
+                }
+            }
+        });
+    }
+}
+
+// ========== ХРАНИЛИЩА ==========
+const userScreenshots = new Map();
+const pendingScreenshots = new Map();
 let blacklist = new Map();
 
-// Загрузка чёрного списка из файла
+// ========== ЧЁРНЫЙ СПИСОК ==========
 function loadBlacklist() {
     try {
         if (fs.existsSync('blacklist.json')) {
             const data = fs.readFileSync('blacklist.json', 'utf8');
             const blacklistObj = JSON.parse(data);
             blacklist = new Map(Object.entries(blacklistObj));
-            console.log(`📋 Чёрный список загружен. Заблокировано пользователей: ${blacklist.size}`);
+            console.log(`📋 Чёрный список загружен. Заблокировано: ${blacklist.size}`);
         } else {
-            console.log('📋 Файл чёрного списка не найден, создаю новый...');
+            console.log('📋 Файл чёрного списка не найден, создаю...');
             saveBlacklist();
         }
     } catch (error) {
@@ -56,7 +244,6 @@ function loadBlacklist() {
     }
 }
 
-// Сохранение чёрного списка в файл
 function saveBlacklist() {
     try {
         const blacklistObj = Object.fromEntries(blacklist);
@@ -67,18 +254,15 @@ function saveBlacklist() {
     }
 }
 
-// Проверка в чёрном списке
 function isBlacklisted(userId) {
     return blacklist.has(userId);
 }
 
-// Получить причину блокировки
 function getBlacklistReason(userId) {
     const entry = blacklist.get(userId);
     return entry ? entry.reason : null;
 }
 
-// Добавление в чёрный список (с отправкой ЛС пользователю)
 async function addToBlacklist(userId, reason, client) {
     blacklist.set(userId, {
         reason: reason || 'Не указана',
@@ -86,7 +270,6 @@ async function addToBlacklist(userId, reason, client) {
     });
     saveBlacklist();
     
-    // Отправляем ЛС пользователю о блокировке
     try {
         const user = await client.users.fetch(userId);
         const embed = new EmbedBuilder()
@@ -96,24 +279,19 @@ async function addToBlacklist(userId, reason, client) {
             .addFields(
                 { name: '📝 Причина', value: reason || 'Не указана', inline: false },
                 { name: '📅 Дата блокировки', value: new Date().toLocaleString('ru-RU'), inline: false },
-                { name: '❓ Что делать?', value: 'Если вы считаете это ошибкой, обратитесь к администратору.', inline: false }
-            )
-            .setFooter({ text: 'Чёрный список | Заявки временно недоступны' });
-        
+                { name: '❓ Что делать?', value: 'Обратитесь к администратору.', inline: false }
+            );
         await user.send({ embeds: [embed] });
-        console.log(`📨 Отправлено ЛС пользователю ${userId} о блокировке`);
     } catch (error) {
-        console.log(`❌ Не удалось отправить ЛС пользователю ${userId}:`, error.message);
+        console.log(`❌ Не удалось отправить ЛС ${userId}:`, error.message);
     }
 }
 
-// Удаление из чёрного списка (с отправкой ЛС пользователю)
 async function removeFromBlacklist(userId, client) {
     const userData = blacklist.get(userId);
     blacklist.delete(userId);
     saveBlacklist();
     
-    // Отправляем ЛС пользователю о разблокировке
     if (userData) {
         try {
             const user = await client.users.fetch(userId);
@@ -122,562 +300,602 @@ async function removeFromBlacklist(userId, client) {
                 .setColor(0x00FF00)
                 .setDescription('Ваша блокировка снята!')
                 .addFields(
-                    { name: '📅 Дата разблокировки', value: new Date().toLocaleString('ru-RU'), inline: false },
-                    { name: '✅ Что теперь?', value: 'Теперь вы снова можете отправлять заявки через команду `!form`', inline: false }
-                )
-                .setFooter({ text: 'Добро пожаловать обратно!' });
-            
+                    { name: '✅ Что теперь?', value: 'Можете отправлять заявки через `!form`', inline: false }
+                );
             await user.send({ embeds: [embed] });
-            console.log(`📨 Отправлено ЛС пользователю ${userId} о разблокировке`);
         } catch (error) {
-            console.log(`❌ Не удалось отправить ЛС пользователю ${userId}:`, error.message);
+            console.log(`❌ Не удалось отправить ЛС ${userId}:`, error.message);
         }
     }
 }
 
+function hasHighRole(member) {
+    return member.roles.cache.has(HIGH_ROLE_ID);
+}
+
+// ========== СОЗДАНИЕ ПОСТОЯННЫХ КНОПОК ==========
+async function setupGatheringButton() {
+    const channel = await client.channels.fetch(CHANNEL_CREATE_GATHERING).catch(() => null);
+    if (!channel) {
+        console.error(`❌ Не найден канал: ${CHANNEL_CREATE_GATHERING}`);
+        return;
+    }
+    
+    let buttonMessage = null;
+    const messages = await channel.messages.fetch({ limit: 10 });
+    buttonMessage = messages.find(m => m.author.id === client.user.id && m.components?.length > 0);
+    
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('create_gathering')
+            .setLabel('🎯 СОЗДАТЬ СБОР')
+            .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+            .setCustomId('remove_points_menu')
+            .setLabel('📉 СНЯТЬ БАЛЛЫ')
+            .setStyle(ButtonStyle.Danger)
+    );
+    
+    const embed = new EmbedBuilder()
+        .setTitle('🎮 УПРАВЛЕНИЕ СИСТЕМОЙ БАЛЛОВ')
+        .setColor(0x00FF00)
+        .setDescription('Нажмите на кнопку ниже, чтобы выполнить действие')
+        .addFields(
+            { name: '🎯 СОЗДАТЬ СБОР', value: 'Создать новый сбор для начисления баллов', inline: false },
+            { name: '📉 СНЯТЬ БАЛЛЫ', value: 'Списать баллы у игрока (неявка, нарушение)', inline: false }
+        )
+        .setFooter({ text: 'Только для роли High' });
+    
+    if (buttonMessage) {
+        await buttonMessage.edit({ embeds: [embed], components: [row] });
+        console.log('✅ Кнопки обновлены');
+    } else {
+        await channel.send({ embeds: [embed], components: [row] });
+        console.log('✅ Кнопки созданы');
+    }
+}
+
+// ========== СОБЫТИЕ ГОТОВНОСТИ ==========
 client.once('ready', () => {
     console.log(`✅ Бот ${client.user.tag} запущен!`);
-    console.log(`📨 Заявки будут приходить к <@${YOUR_USER_ID}>`);
-    console.log(`💰 Максимальная сумма запроса: 100 000 ₽`);
+    console.log(`📨 Заявки на финансирование → <@${YOUR_USER_ID}>`);
+    console.log(`💰 Максимальная сумма: 100 000 ₽`);
+    console.log(`🎮 Система сборов активна!`);
     loadBlacklist();
+    setupGatheringButton();
 });
 
-// КОМАНДЫ
+// ========== КОМАНДЫ ==========
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     
-    // КОМАНДЫ ДЛЯ РАБОТЫ С ЧЁРНЫМ СПИСКОМ (только для владельца)
+    // Команды для владельца (чёрный список)
     if (message.author.id === YOUR_USER_ID) {
-        
-        // ПОМОЩЬ: !чс помощь (ЭФЕМЕРНОЕ - удалится через 15 секунд)
-        if (message.content === '!чс помощь' || message.content === '!чс хелп') {
+        if (message.content === '!чс помощь') {
             const embed = new EmbedBuilder()
                 .setTitle('📋 Управление чёрным списком')
                 .setColor(0xFF0000)
                 .addFields(
-                    { name: '!чс добавить @user причина', value: '➕ Добавить пользователя в чёрный список (придёт ЛС)', inline: false },
-                    { name: '!чс удалить @user', value: '➖ Удалить пользователя из чёрного списка (придёт ЛС)', inline: false },
-                    { name: '!чс список', value: '📋 Показать всех заблокированных пользователей', inline: false },
-                    { name: '!чс проверить @user', value: '🔍 Проверить, в чёрном ли списке пользователь', inline: false },
-                    { name: '!чс очистить', value: '🗑️ Очистить весь чёрный список (с подтверждением)', inline: false }
-                )
-                .setFooter({ text: 'Только для владельца бота | Сообщение исчезнет через 15 секунд' });
-            
+                    { name: '!чс добавить @user причина', value: 'Добавить в ЧС', inline: false },
+                    { name: '!чс удалить @user', value: 'Удалить из ЧС', inline: false },
+                    { name: '!чс список', value: 'Показать ЧС', inline: false },
+                    { name: '!чс очистить', value: 'Очистить ЧС', inline: false }
+                );
             const reply = await message.reply({ embeds: [embed] });
             setTimeout(() => reply.delete().catch(() => {}), 15000);
             return message.delete().catch(() => {});
         }
         
-        // ДОБАВИТЬ: !чс добавить @user причина (ЭФЕМЕРНОЕ)
         if (message.content.startsWith('!чс добавить')) {
             const args = message.content.split(' ');
             const mention = args[2];
             const userId = mention ? mention.replace(/[<@!>]/g, '') : null;
             const reason = args.slice(3).join(' ') || 'Не указана';
-            
             if (!userId) {
-                const reply = await message.reply('❌ **Как использовать:**\n`!чс добавить @пользователь причина блокировки`\n\nПример: `!чс добавить @Вася Спам заявками`');
+                const reply = await message.reply('❌ !чс добавить @user причина');
                 setTimeout(() => reply.delete().catch(() => {}), 10000);
                 return message.delete().catch(() => {});
             }
-            
-            if (isBlacklisted(userId)) {
-                const reply = await message.reply(`⚠️ Пользователь <@${userId}> **УЖЕ** в чёрном списке!`);
-                setTimeout(() => reply.delete().catch(() => {}), 10000);
-                return message.delete().catch(() => {});
-            }
-            
             await addToBlacklist(userId, reason, client);
-            const reply = await message.reply(`✅ **Пользователь добавлен в чёрный список!**\n\n👤 Пользователь: <@${userId}>\n📝 Причина: ${reason}\n📨 Ему отправлено уведомление в ЛС.`);
+            const reply = await message.reply(`✅ <@${userId}> добавлен в ЧС`);
             setTimeout(() => reply.delete().catch(() => {}), 15000);
             return message.delete().catch(() => {});
         }
         
-        // УДАЛИТЬ: !чс удалить @user (ЭФЕМЕРНОЕ)
         if (message.content.startsWith('!чс удалить')) {
             const args = message.content.split(' ');
             const mention = args[2];
             const userId = mention ? mention.replace(/[<@!>]/g, '') : null;
-            
             if (!userId) {
-                const reply = await message.reply('❌ **Как использовать:**\n`!чс удалить @пользователь`\n\nПример: `!чс удалить @Вася`');
+                const reply = await message.reply('❌ !чс удалить @user');
                 setTimeout(() => reply.delete().catch(() => {}), 10000);
                 return message.delete().catch(() => {});
             }
-            
-            if (!isBlacklisted(userId)) {
-                const reply = await message.reply(`⚠️ Пользователь <@${userId}> **НЕ** в чёрном списке!`);
-                setTimeout(() => reply.delete().catch(() => {}), 10000);
-                return message.delete().catch(() => {});
-            }
-            
             await removeFromBlacklist(userId, client);
-            const reply = await message.reply(`✅ **Пользователь удалён из чёрного списка!**\n\n👤 Пользователь: <@${userId}>\n📨 Ему отправлено уведомление в ЛС.`);
+            const reply = await message.reply(`✅ <@${userId}> удалён из ЧС`);
             setTimeout(() => reply.delete().catch(() => {}), 15000);
             return message.delete().catch(() => {});
         }
         
-        // СПИСОК: !чс список (ЭФЕМЕРНОЕ)
         if (message.content === '!чс список') {
             if (blacklist.size === 0) {
-                const reply = await message.reply('📋 **Чёрный список пуст.**\n\nВсе пользователи могут отправлять заявки.');
+                const reply = await message.reply('📋 ЧС пуст');
                 setTimeout(() => reply.delete().catch(() => {}), 15000);
                 return message.delete().catch(() => {});
             }
-            
-            const list = Array.from(blacklist.entries()).map(([id, data], index) => {
-                return `${index + 1}. <@${id}>\n   📝 Причина: ${data.reason}\n   📅 Дата: ${new Date(data.date).toLocaleString('ru-RU')}`;
-            }).join('\n\n');
-            
-            const embed = new EmbedBuilder()
-                .setTitle(`📋 ЧЁРНЫЙ СПИСОК (${blacklist.size} пользователей)`)
-                .setColor(0xFF0000)
-                .setDescription(list)
-                .setTimestamp();
-            
+            const list = Array.from(blacklist.entries()).map(([id, data]) => `<@${id}> - ${data.reason}`).join('\n');
+            const embed = new EmbedBuilder().setTitle('📋 ЧЁРНЫЙ СПИСОК').setDescription(list).setColor(0xFF0000);
             const reply = await message.reply({ embeds: [embed] });
             setTimeout(() => reply.delete().catch(() => {}), 30000);
             return message.delete().catch(() => {});
         }
         
-        // ПРОВЕРИТЬ: !чс проверить @user (ЭФЕМЕРНОЕ)
-        if (message.content.startsWith('!чс проверить')) {
-            const args = message.content.split(' ');
-            const mention = args[2];
-            const userId = mention ? mention.replace(/[<@!>]/g, '') : null;
-            
-            if (!userId) {
-                const reply = await message.reply('❌ **Как использовать:**\n`!чс проверить @пользователь`\n\nПример: `!чс проверить @Вася`');
-                setTimeout(() => reply.delete().catch(() => {}), 10000);
-                return message.delete().catch(() => {});
-            }
-            
-            let reply;
-            if (isBlacklisted(userId)) {
-                const reason = getBlacklistReason(userId);
-                const embed = new EmbedBuilder()
-                    .setTitle('⚠️ ПОЛЬЗОВАТЕЛЬ В ЧЁРНОМ СПИСКЕ')
-                    .setColor(0xFF0000)
-                    .addFields(
-                        { name: '👤 Пользователь', value: `<@${userId}>`, inline: true },
-                        { name: '📝 Причина', value: reason, inline: true },
-                        { name: '📅 Дата блокировки', value: new Date(blacklist.get(userId).date).toLocaleString('ru-RU'), inline: false }
-                    );
-                reply = await message.reply({ embeds: [embed] });
-            } else {
-                const embed = new EmbedBuilder()
-                    .setTitle('✅ ПОЛЬЗОВАТЕЛЬ НЕ В ЧЁРНОМ СПИСКЕ')
-                    .setColor(0x00FF00)
-                    .setDescription(`Пользователь <@${userId}> может отправлять заявки.`);
-                reply = await message.reply({ embeds: [embed] });
-            }
-            setTimeout(() => reply.delete().catch(() => {}), 15000);
-            return message.delete().catch(() => {});
-        }
-        
-        // ОЧИСТИТЬ: !чс очистить (с кнопками)
         if (message.content === '!чс очистить') {
-            if (blacklist.size === 0) {
-                const reply = await message.reply('📋 Чёрный список и так пуст.');
-                setTimeout(() => reply.delete().catch(() => {}), 10000);
-                return message.delete().catch(() => {});
-            }
-            
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId('clear_blacklist_confirm')
-                    .setLabel('⚠️ ДА, ОЧИСТИТЬ ВЕСЬ СПИСОК')
-                    .setStyle(ButtonStyle.Danger),
-                new ButtonBuilder()
-                    .setCustomId('clear_blacklist_cancel')
-                    .setLabel('❌ Отмена')
-                    .setStyle(ButtonStyle.Secondary)
-            );
-            
-            const reply = await message.reply({
-                content: `⚠️ **ВНИМАНИЕ!** Вы собираетесь очистить весь чёрный список (${blacklist.size} пользователей).\n\nЭто действие нельзя отменить!`,
-                components: [row]
-            });
-            
-            // Удаляем команду пользователя
-            await message.delete().catch(() => {});
-            
-            // Удаляем сообщение с кнопками через 30 секунд
-            setTimeout(() => reply.delete().catch(() => {}), 30000);
+            blacklist.clear();
+            saveBlacklist();
+            const reply = await message.reply('✅ ЧС очищен');
+            setTimeout(() => reply.delete().catch(() => {}), 10000);
+            return message.delete().catch(() => {});
         }
     }
     
-    // Обычная команда !form
+    // Команда !form
     if (message.content === '!form') {
-        // Проверка чёрного списка
         if (isBlacklisted(message.author.id)) {
-            const reason = getBlacklistReason(message.author.id);
-            const reply = await message.reply({
-                content: `⚠️ **Вы в чёрном списке!**\n\n📝 Причина: ${reason}\n\nОбратитесь к администратору для снятия блокировки.`
-            });
+            const reply = await message.reply('⚠️ Вы в чёрном списке!');
             setTimeout(() => reply.delete().catch(() => {}), 15000);
             return message.delete().catch(() => {});
         }
-        
         const button = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId('open_form')
-                .setLabel('📝 Заполнить заявку')
-                .setStyle(ButtonStyle.Primary)
+            new ButtonBuilder().setCustomId('open_form').setLabel('📝 Заполнить заявку').setStyle(ButtonStyle.Primary)
         );
-
-        await message.channel.send({
-            content: 'Нажми на кнопку, чтобы заполнить заявку:',
-            components: [button]
-        });
-        
-        // Удаляем команду пользователя
+        await message.channel.send({ content: 'Нажми на кнопку, чтобы заполнить заявку:', components: [button] });
         await message.delete().catch(() => {});
     }
+    
+    // Команды для баллов
+    if (message.content === '!баллы') {
+        getUserPoints(message.author.id, (points) => {
+            const embed = new EmbedBuilder().setTitle('💰 ВАШИ БАЛЛЫ').setColor(0x00FF00).setDescription(`У вас **${points}** баллов!`);
+            message.reply({ embeds: [embed] });
+        });
+    }
+    
+    if (message.content === '!топ') {
+        db.all('SELECT user_id, points, username FROM player_points ORDER BY points DESC LIMIT 10', (err, rows) => {
+            if (err || rows.length === 0) return message.reply('📊 Топ пуст.');
+            let description = '';
+            rows.forEach((row, index) => {
+                description += `${index + 1}. ${row.username || `<@${row.user_id}>`} — **${row.points}** баллов\n`;
+            });
+            const embed = new EmbedBuilder().setTitle('🏆 ТОП ИГРОКОВ').setColor(0xFFD700).setDescription(description);
+            message.reply({ embeds: [embed] });
+        });
+    }
+    
+    if (message.content.startsWith('!история')) {
+        const args = message.content.split(' ');
+        const mention = args[1];
+        const userId = mention ? mention.replace(/[<@!>]/g, '') : message.author.id;
+        
+        db.all(`SELECT * FROM points_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 10`, [userId], async (err, rows) => {
+            if (err || rows.length === 0) {
+                const reply = await message.reply(`📋 История для <@${userId}> пуста.`);
+                setTimeout(() => reply.delete().catch(() => {}), 10000);
+                return message.delete().catch(() => {});
+            }
+            
+            let description = '';
+            rows.forEach(row => {
+                const sign = row.change > 0 ? '+' : '';
+                const date = new Date(row.created_at).toLocaleString('ru-RU');
+                description += `**${sign}${row.change}** → ${row.new_points} | ${row.reason} | ${date}\n`;
+            });
+            
+            const embed = new EmbedBuilder()
+                .setTitle(`📋 ИСТОРИЯ БАЛЛОВ <@${userId}>`)
+                .setColor(0x00AAFF)
+                .setDescription(description)
+                .setFooter({ text: 'Последние 10 изменений' });
+            
+            const reply = await message.reply({ embeds: [embed] });
+            setTimeout(() => reply.delete().catch(() => {}), 30000);
+            message.delete().catch(() => {});
+        });
+    }
 });
 
-// Обработка кнопок подтверждения очистки чёрного списка
+// ========== СОЗДАНИЕ СБОРА ==========
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
-    
-    if (interaction.customId === 'clear_blacklist_confirm') {
-        const count = blacklist.size;
-        
-        // Отправляем ЛС всем заблокированным о разблокировке
-        for (const [userId] of blacklist) {
-            try {
-                const user = await client.users.fetch(userId);
-                const embed = new EmbedBuilder()
-                    .setTitle('✅ Чёрный список очищен')
-                    .setColor(0x00FF00)
-                    .setDescription('Администратор очистил весь чёрный список!')
-                    .addFields(
-                        { name: '📅 Дата разблокировки', value: new Date().toLocaleString('ru-RU'), inline: false },
-                        { name: '✅ Что теперь?', value: 'Теперь вы снова можете отправлять заявки через команду `!form`', inline: false }
-                    );
-                await user.send({ embeds: [embed] });
-            } catch (error) {
-                console.log(`❌ Не удалось отправить ЛС пользователю ${userId}:`, error.message);
-            }
+    if (interaction.customId === 'create_gathering') {
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+        if (!hasHighRole(member)) {
+            return interaction.reply({ content: `❌ Требуется роль <@&${HIGH_ROLE_ID}>`, ephemeral: true });
         }
         
-        blacklist.clear();
-        saveBlacklist();
-        
-        await interaction.update({
-            content: `✅ **Чёрный список очищен!** Удалено ${count} пользователей. Им отправлены уведомления в ЛС.`,
-            components: []
-        });
-        
-        // Удаляем сообщение через 10 секунд
-        setTimeout(() => interaction.deleteReply().catch(() => {}), 10000);
-    }
-    
-    if (interaction.customId === 'clear_blacklist_cancel') {
-        await interaction.update({
-            content: `❌ Очистка чёрного списка отменена.`,
-            components: []
-        });
-        setTimeout(() => interaction.deleteReply().catch(() => {}), 5000);
+        const modal = new ModalBuilder().setCustomId(`create_gathering_modal_${interaction.user.id}`).setTitle('🎯 Создание сбора');
+        const titleInput = new TextInputBuilder().setCustomId('title').setLabel('Название сбора').setStyle(TextInputStyle.Short).setPlaceholder('Ограбление казино').setRequired(true);
+        const pointsInput = new TextInputBuilder().setCustomId('points').setLabel('Количество баллов').setStyle(TextInputStyle.Short).setPlaceholder('50').setRequired(true);
+        modal.addComponents(new ActionRowBuilder().addComponents(titleInput), new ActionRowBuilder().addComponents(pointsInput));
+        await interaction.showModal(modal);
     }
 });
 
-// Остальной код (форма, скриншоты, кнопки) остаётся без изменений
-// Обработка кнопки открытия формы
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton()) return;
-    if (interaction.customId !== 'open_form') return;
-    
-    // Проверка чёрного списка
-    if (isBlacklisted(interaction.user.id)) {
-        const reason = getBlacklistReason(interaction.user.id);
-        return interaction.reply({
-            content: `⚠️ **Вы в чёрном списке!**\n\n📝 Причина: ${reason}\n\nОбратитесь к администратору для снятия блокировки.`,
-            ephemeral: true
-        });
-    }
-
-    const modal = new ModalBuilder()
-        .setCustomId(`money_form_${interaction.user.id}`)
-        .setTitle('💰 Заявка на финансирование');
-
-    const amountInput = new TextInputBuilder()
-        .setCustomId('amount')
-        .setLabel('Сколько денег вам требуется? (до 100 000 ₽)')
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder('Например: 50 000 ₽ (максимум 100 000 ₽)')
-        .setRequired(true);
-
-    const currentMoneyInput = new TextInputBuilder()
-        .setCustomId('current_money')
-        .setLabel('Сколько сейчас у вас средств?')
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder('Например: 10 000 ₽')
-        .setRequired(true);
-
-    const reasonInput = new TextInputBuilder()
-        .setCustomId('reason')
-        .setLabel('Зачем вам нужны эти деньги?')
-        .setStyle(TextInputStyle.Paragraph)
-        .setPlaceholder('Напишите подробную причину...')
-        .setRequired(true);
-
-    const firstRow = new ActionRowBuilder().addComponents(amountInput);
-    const secondRow = new ActionRowBuilder().addComponents(currentMoneyInput);
-    const thirdRow = new ActionRowBuilder().addComponents(reasonInput);
-
-    modal.addComponents(firstRow, secondRow, thirdRow);
-
-    await interaction.showModal(modal);
-});
-
-// Обработка отправки формы (модальное окно)
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isModalSubmit()) return;
-    if (!interaction.customId.startsWith('money_form_')) return;
-
-    // Проверка чёрного списка
-    if (isBlacklisted(interaction.user.id)) {
-        const reason = getBlacklistReason(interaction.user.id);
-        return interaction.reply({
-            content: `⚠️ **Вы в чёрном списке!**\n\n📝 Причина: ${reason}\n\nОбратитесь к администратору.`,
-            ephemeral: true
-        });
-    }
-
-    const amountRaw = interaction.fields.getTextInputValue('amount');
-    const currentMoney = interaction.fields.getTextInputValue('current_money');
-    const reason = interaction.fields.getTextInputValue('reason');
-    const userName = interaction.user.tag;
-    const userId = interaction.user.id;
-
-    // Проверка суммы (до 100 000)
-    const amountNumber = parseInt(amountRaw.replace(/[^\d-]/g, ''), 10);
+    if (!interaction.customId.startsWith('create_gathering_modal_')) return;
     
-    if (isNaN(amountNumber) || amountNumber > 100000) {
-        return interaction.reply({
-            content: `❌ **Ошибка!**\n\nСумма запроса не может превышать **100 000 ₽**.\n\nВы указали: ${amountRaw}\n\n⚠️ **Напоминание:** Максимальная сумма для одной заявки — **100 000 ₽**.\n\nПожалуйста, начните заново с команды \`!form\` и укажите корректную сумму.`,
-            ephemeral: true
-        });
+    const title = interaction.fields.getTextInputValue('title');
+    const points = parseInt(interaction.fields.getTextInputValue('points'));
+    
+    if (isNaN(points) || points < 1) {
+        return interaction.reply({ content: '❌ Баллы должны быть положительным числом!', ephemeral: true });
     }
     
-    if (amountNumber <= 0) {
-        return interaction.reply({
-            content: `❌ **Ошибка!**\n\nСумма должна быть положительным числом.\n\nВы указали: ${amountRaw}\n\nПожалуйста, начните заново с команды \`!form\`.`,
-            ephemeral: true
+    db.get('SELECT COUNT(*) as count FROM gatherings WHERE is_active = 1', (err, row) => {
+        if (row && row.count >= 5) {
+            return interaction.reply({ content: '❌ Лимит активных сборов (5)', ephemeral: true });
+        }
+        
+        db.run(`INSERT INTO gatherings (title, points, organizer_id, is_active) VALUES (?, ?, ?, 1)`, [title, points, interaction.user.id], async function(err) {
+            if (err) return interaction.reply({ content: '❌ Ошибка', ephemeral: true });
+            
+            const gatherId = this.lastID;
+            const announceChannel = await client.channels.fetch(CHANNEL_GATHERING_ANNOUNCE);
+            const rowBtn = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`submit_screenshot_${gatherId}`).setLabel('📸 ПРИКРЕПИТЬ СКРИН').setStyle(ButtonStyle.Primary)
+            );
+            const embed = new EmbedBuilder().setTitle('🎯 НОВЫЙ СБОР').setColor(0x00FF00).setDescription(`**${title}**`).addFields(
+                { name: '🏆 Награда', value: `${points} баллов`, inline: true },
+                { name: '👤 Организатор', value: `<@${interaction.user.id}>`, inline: true },
+                { name: '📌 Как участвовать', value: 'Нажмите кнопку и отправьте скрин в ЛС', inline: false }
+            ).setFooter({ text: `ID: ${gatherId}` }).setTimestamp();
+            
+            const sentMessage = await announceChannel.send({ content: `@everyone`, embeds: [embed], components: [rowBtn] });
+            db.run('UPDATE gatherings SET message_id = ?, channel_id = ? WHERE id = ?', [sentMessage.id, CHANNEL_GATHERING_ANNOUNCE, gatherId]);
+            await interaction.reply({ content: `✅ Сбор "${title}" создан!`, ephemeral: true });
         });
-    }
-
-    userScreenshots.set(userId, {
-        amount: amountRaw,
-        currentMoney,
-        reason,
-        userName,
-        timestamp: Date.now()
-    });
-
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`add_screenshot_${userId}`)
-            .setLabel('📸 Добавить скриншот средств')
-            .setStyle(ButtonStyle.Secondary)
-    );
-
-    await interaction.reply({
-        content: `✅ **Часть 1/2 заполнена!**\n\n📝 Сумма: **${amountRaw}**\n💰 Текущие средства: **${currentMoney}**\n❓ Причина: ${reason}\n\n**Теперь отправьте скриншот ваших средств**\n\nНажмите на кнопку ниже:`,
-        components: [row],
-        ephemeral: true
     });
 });
 
-// Обработка кнопки добавления скриншота
+// ========== ОТПРАВКА СКРИНА В ЛС ==========
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
-    if (!interaction.customId.startsWith('add_screenshot_')) return;
-
-    const userId = interaction.customId.replace('add_screenshot_', '');
+    if (!interaction.customId.startsWith('submit_screenshot_')) return;
     
-    if (userId !== interaction.user.id) {
-        return interaction.reply({
-            content: '❌ Это не ваша заявка!',
-            ephemeral: true
-        });
-    }
+    const gatheringId = parseInt(interaction.customId.replace('submit_screenshot_', ''));
     
-    // Проверка чёрного списка
-    if (isBlacklisted(interaction.user.id)) {
-        return interaction.reply({
-            content: '⚠️ Вы в чёрном списке!',
+    db.get('SELECT * FROM gatherings WHERE id = ? AND is_active = 1', [gatheringId], async (err, gathering) => {
+        if (err || !gathering) {
+            return interaction.reply({ content: '❌ Сбор не найден', ephemeral: true });
+        }
+        
+        pendingScreenshots.set(interaction.user.id, {
+            gatheringId: gatheringId,
+            gatheringTitle: gathering.title,
+            points: gathering.points,
+            timestamp: Date.now()
+        });
+        
+        await interaction.reply({
+            content: `📸 **Отправьте скриншот в ЛС боту!**\n\n🎯 ${gathering.title}\n🏆 ${gathering.points} баллов\n\nУ вас 5 минут.`,
             ephemeral: true
         });
-    }
-
-    const formData = userScreenshots.get(userId);
-    if (!formData) {
-        return interaction.reply({
-            content: '❌ Данные заявки не найдены. Пожалуйста, начните заново с команды !form',
-            ephemeral: true
-        });
-    }
-
-    await interaction.reply({
-        content: `📸 **Отправьте скриншот ваших средств!**\n\nПросто отправьте изображение в личные сообщения боту.`,
-        ephemeral: true
+        
+        setTimeout(() => pendingScreenshots.delete(interaction.user.id), 300000);
+        
+        try {
+            await interaction.user.send(`📸 Отправьте скрин для сбора "${gathering.title}" (${gathering.points} баллов)`);
+        } catch (e) {}
     });
-
-    userScreenshots.set(userId, { ...formData, waitingForScreenshot: true });
-    
-    try {
-        await interaction.user.send(`📸 **Отправьте скриншот ваших средств сюда, чтобы завершить заявку.**`);
-    } catch (e) {
-        console.log('Не удалось отправить ЛС');
-    }
 });
 
-// Обработка скриншотов в ЛС
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     if (message.guild) return;
     
-    const userId = message.author.id;
-    const formData = userScreenshots.get(userId);
+    const pendingData = pendingScreenshots.get(message.author.id);
+    if (!pendingData) return;
     
-    if (!formData || !formData.waitingForScreenshot) return;
-    
-    // Проверка чёрного списка
-    if (isBlacklisted(userId)) {
-        return message.reply('⚠️ Вы в чёрном списке!');
-    }
-    
-    if (!message.attachments || message.attachments.size === 0) {
-        return message.reply('❌ Отправьте изображение.');
+    if (!message.attachments?.size) {
+        return message.reply('❌ Отправьте изображение');
     }
     
     const screenshot = message.attachments.find(att => att.contentType?.startsWith('image/'));
-    
     if (!screenshot) {
-        return message.reply('❌ Отправьте изображение в формате JPG, PNG, GIF или WEBP.');
+        return message.reply('❌ Отправьте изображение (JPG, PNG, GIF)');
     }
     
-    const embed = new EmbedBuilder()
-        .setColor(0x00FF00)
-        .setTitle('📬 Новая заявка на финансирование!')
-        .setDescription(`<@${YOUR_USER_ID}>, поступила новая заявка`)
-        .addFields(
-            { name: '👤 От кого', value: `${formData.userName} (${userId})`, inline: false },
-            { name: '💰 Требуемая сумма', value: formData.amount, inline: true },
-            { name: '💵 Текущие средства', value: formData.currentMoney, inline: true },
-            { name: '❓ Причина', value: formData.reason, inline: false },
-            { name: '📸 Скриншот', value: `[Нажмите для просмотра](${screenshot.url})`, inline: false }
-        )
-        .setImage(screenshot.url)
-        .setTimestamp()
-        .setFooter({ text: 'Максимум 100 000 ₽' });
+    db.get('SELECT * FROM gatherings WHERE id = ? AND is_active = 1', [pendingData.gatheringId], async (err, gathering) => {
+        if (err || !gathering) {
+            await message.reply('❌ Сбор закрыт');
+            pendingScreenshots.delete(message.author.id);
+            return;
+        }
+        
+        db.run(`INSERT INTO screenshot_requests (gathering_id, user_id, screenshot_url, comment, status) VALUES (?, ?, ?, ?, 'pending')`,
+            [pendingData.gatheringId, message.author.id, screenshot.url, 'ЛС'],
+            async function(err) {
+                if (err) {
+                    await message.reply('❌ Ошибка');
+                    pendingScreenshots.delete(message.author.id);
+                    return;
+                }
+                
+                const modChannel = await client.channels.fetch(CHANNEL_MODERATION);
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`approve_screenshot_${this.lastID}_${pendingData.gatheringId}_${message.author.id}`).setLabel('✅ ВЫДАТЬ').setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId(`deny_screenshot_${this.lastID}_${pendingData.gatheringId}_${message.author.id}`).setLabel('❌ ОТКАЗАТЬ').setStyle(ButtonStyle.Danger)
+                );
+                
+                const embed = new EmbedBuilder().setTitle('📸 ЗАЯВКА').setColor(0xFFA500).addFields(
+                    { name: '🎯 Сбор', value: gathering.title },
+                    { name: '🏆 Баллы', value: `${gathering.points}` },
+                    { name: '👤 Участник', value: `<@${message.author.id}>` },
+                    { name: '📸 Скрин', value: `[Ссылка](${screenshot.url})` }
+                ).setImage(screenshot.url).setTimestamp();
+                
+                await modChannel.send({ content: `<@&${HIGH_ROLE_ID}>`, embeds: [embed], components: [row] });
+                await message.reply('✅ Скрин отправлен на проверку!');
+                pendingScreenshots.delete(message.author.id);
+            });
+    });
+});
+
+// ========== СНЯТИЕ БАЛЛОВ ЧЕРЕЗ КНОПКУ ==========
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (interaction.customId === 'remove_points_menu') {
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+        if (!hasHighRole(member)) {
+            return interaction.reply({ content: `❌ Требуется роль <@&${HIGH_ROLE_ID}>`, ephemeral: true });
+        }
+        
+        const modal = new ModalBuilder().setCustomId(`remove_points_modal_${interaction.user.id}`).setTitle('📉 Снятие баллов');
+        const userInput = new TextInputBuilder().setCustomId('user_id').setLabel('Пользователь (@ или ID)').setStyle(TextInputStyle.Short).setPlaceholder('@Вася').setRequired(true);
+        const pointsInput = new TextInputBuilder().setCustomId('points').setLabel('Сколько баллов снять?').setStyle(TextInputStyle.Short).setPlaceholder('50').setRequired(true);
+        const reasonInput = new TextInputBuilder().setCustomId('reason').setLabel('Причина').setStyle(TextInputStyle.Paragraph).setPlaceholder('Неявка в строй').setRequired(true);
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(userInput),
+            new ActionRowBuilder().addComponents(pointsInput),
+            new ActionRowBuilder().addComponents(reasonInput)
+        );
+        await interaction.showModal(modal);
+    }
+});
+
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isModalSubmit()) return;
+    if (!interaction.customId.startsWith('remove_points_modal_')) return;
+    
+    const userInput = interaction.fields.getTextInputValue('user_id');
+    const points = parseInt(interaction.fields.getTextInputValue('points'));
+    const reason = interaction.fields.getTextInputValue('reason');
+    
+    let userId = userInput.replace(/[<@!>]/g, '').trim();
+    if (!userId.match(/^\d+$/)) {
+        return interaction.reply({ content: '❌ Укажите корректного пользователя', ephemeral: true });
+    }
+    
+    if (isNaN(points) || points <= 0) {
+        return interaction.reply({ content: '❌ Баллы должны быть положительным числом', ephemeral: true });
+    }
+    
+    let targetUser;
+    try {
+        targetUser = await client.users.fetch(userId);
+    } catch (e) {
+        return interaction.reply({ content: '❌ Пользователь не найден', ephemeral: true });
+    }
+    
+    db.get('SELECT points FROM player_points WHERE user_id = ?', [userId], async (err, row) => {
+        const currentPoints = row ? row.points : 0;
+        if (currentPoints === 0) {
+            return interaction.reply({ content: `⚠️ У ${targetUser.tag} 0 баллов`, ephemeral: true });
+        }
+        
+        removePoints(userId, points, targetUser.tag, async (success, oldPoints, newPoints) => {
+            if (success) {
+                logPointsHistory(userId, -points, newPoints, reason, interaction.user.id);
+                
+                try {
+                    await targetUser.send(`⚠️ **Снято ${points} баллов**\n📝 Причина: ${reason}\n📊 ${oldPoints} → ${newPoints}`);
+                } catch (e) {}
+                
+                await interaction.reply({ content: `✅ Снято ${points} баллов у ${targetUser.tag}\n${oldPoints} → ${newPoints}`, ephemeral: true });
+            } else {
+                await interaction.reply({ content: '❌ Ошибка', ephemeral: true });
+            }
+        });
+    });
+});
+
+// ========== ОБРАБОТКА РЕШЕНИЙ HIGH ==========
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (!interaction.customId.startsWith('approve_screenshot_')) return;
+    
+    const parts = interaction.customId.split('_');
+    const requestId = parseInt(parts[2]);
+    const gatheringId = parseInt(parts[3]);
+    const userId = parts[4];
+    
+    const member = await interaction.guild.members.fetch(interaction.user.id);
+    if (!hasHighRole(member)) {
+        return interaction.reply({ content: '❌ Нет прав', ephemeral: true });
+    }
+    
+    db.get('SELECT * FROM screenshot_requests WHERE id = ? AND status = "pending"', [requestId], async (err, request) => {
+        if (err || !request) return interaction.reply({ content: '❌ Уже обработано', ephemeral: true });
+        
+        db.get('SELECT * FROM gatherings WHERE id = ?', [gatheringId], async (err, gathering) => {
+            db.run('UPDATE screenshot_requests SET status = "approved", reviewed_by = ? WHERE id = ?', [interaction.user.id, requestId]);
+            
+            const user = await client.users.fetch(userId);
+            addPoints(userId, gathering.points, user.tag, async () => {
+                const embed = EmbedBuilder.from(interaction.message.embeds[0]).setColor(0x00FF00).setTitle('✅ ОДОБРЕНО');
+                await interaction.update({ embeds: [embed], components: [] });
+                await user.send(`✅ +${gathering.points} баллов за сбор "${gathering.title}"`).catch(() => {});
+                await interaction.followUp({ content: `✅ ${user.tag} +${gathering.points} баллов`, ephemeral: true });
+            });
+        });
+    });
+});
+
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (!interaction.customId.startsWith('deny_screenshot_')) return;
+    
+    const parts = interaction.customId.split('_');
+    const requestId = parseInt(parts[2]);
+    const userId = parts[4];
+    
+    const member = await interaction.guild.members.fetch(interaction.user.id);
+    if (!hasHighRole(member)) {
+        return interaction.reply({ content: '❌ Нет прав', ephemeral: true });
+    }
+    
+    db.run('UPDATE screenshot_requests SET status = "denied", reviewed_by = ? WHERE id = ?', [interaction.user.id, requestId]);
+    const embed = EmbedBuilder.from(interaction.message.embeds[0]).setColor(0xFF0000).setTitle('❌ ОТКЛОНЕНО');
+    await interaction.update({ embeds: [embed], components: [] });
+    
+    const user = await client.users.fetch(userId);
+    await user.send(`❌ Скрин отклонён`).catch(() => {});
+    await interaction.followUp({ content: `❌ Отклонено`, ephemeral: true });
+});
+
+// ========== СТАРАЯ СИСТЕМА (ФИНАНСИРОВАНИЕ) ==========
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (interaction.customId !== 'open_form') return;
+    
+    if (isBlacklisted(interaction.user.id)) {
+        return interaction.reply({ content: '⚠️ Вы в ЧС', ephemeral: true });
+    }
+    
+    const modal = new ModalBuilder().setCustomId(`money_form_${interaction.user.id}`).setTitle('💰 Заявка на финансирование');
+    const amountInput = new TextInputBuilder().setCustomId('amount').setLabel('Сумма (до 100 000 ₽)').setStyle(TextInputStyle.Short).setPlaceholder('50 000').setRequired(true);
+    const currentMoneyInput = new TextInputBuilder().setCustomId('current_money').setLabel('Текущие средства').setStyle(TextInputStyle.Short).setPlaceholder('10 000').setRequired(true);
+    const reasonInput = new TextInputBuilder().setCustomId('reason').setLabel('Причина').setStyle(TextInputStyle.Paragraph).setPlaceholder('Подробная причина...').setRequired(true);
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(amountInput),
+        new ActionRowBuilder().addComponents(currentMoneyInput),
+        new ActionRowBuilder().addComponents(reasonInput)
+    );
+    await interaction.showModal(modal);
+});
+
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isModalSubmit()) return;
+    if (!interaction.customId.startsWith('money_form_')) return;
+    
+    const amountRaw = interaction.fields.getTextInputValue('amount');
+    const currentMoney = interaction.fields.getTextInputValue('current_money');
+    const reason = interaction.fields.getTextInputValue('reason');
+    const amountNum = parseInt(amountRaw.replace(/[^\d-]/g, ''), 10);
+    
+    if (isNaN(amountNum) || amountNum > 100000) {
+        return interaction.reply({ content: '❌ Сумма до 100 000 ₽', ephemeral: true });
+    }
+    
+    userScreenshots.set(interaction.user.id, {
+        amount: amountRaw, currentMoney, reason, userName: interaction.user.tag, timestamp: Date.now()
+    });
     
     const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`approve_${userId}`)
-            .setLabel('✅ Одобрить')
-            .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId(`deny_${userId}`)
-            .setLabel('❌ Отклонить')
-            .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-            .setCustomId(`ask_${userId}`)
-            .setLabel('💬 Уточнить')
-            .setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`add_screenshot_${interaction.user.id}`).setLabel('📸 Добавить скрин').setStyle(ButtonStyle.Secondary)
+    );
+    await interaction.reply({ content: `✅ Часть 1/2 заполнена!\n📝 ${amountRaw}\n💰 ${currentMoney}\n❓ ${reason}\n\nТеперь отправьте скрин в ЛС`, components: [row], ephemeral: true });
+});
+
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (!interaction.customId.startsWith('add_screenshot_')) return;
+    
+    const userId = interaction.customId.replace('add_screenshot_', '');
+    if (userId !== interaction.user.id) return interaction.reply({ content: '❌ Не ваша заявка', ephemeral: true });
+    
+    const formData = userScreenshots.get(userId);
+    if (!formData) return interaction.reply({ content: '❌ Данные не найдены', ephemeral: true });
+    
+    await interaction.reply({ content: '📸 Отправьте скрин в ЛС боту', ephemeral: true });
+    userScreenshots.set(userId, { ...formData, waitingForScreenshot: true });
+    try { await interaction.user.send('📸 Отправьте скриншот ваших средств'); } catch (e) {}
+});
+
+client.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+    if (message.guild) return;
+    
+    const formData = userScreenshots.get(message.author.id);
+    if (!formData?.waitingForScreenshot) return;
+    if (!message.attachments?.size) return message.reply('❌ Отправьте изображение');
+    
+    const screenshot = message.attachments.find(att => att.contentType?.startsWith('image/'));
+    if (!screenshot) return message.reply('❌ Отправьте изображение');
+    
+    const embed = new EmbedBuilder().setColor(0x00FF00).setTitle('📬 Заявка на финансирование')
+        .setDescription(`<@${YOUR_USER_ID}>`).addFields(
+            { name: '👤 От кого', value: formData.userName },
+            { name: '💰 Сумма', value: formData.amount },
+            { name: '💵 Средства', value: formData.currentMoney },
+            { name: '❓ Причина', value: formData.reason },
+            { name: '📸 Скрин', value: `[Ссылка](${screenshot.url})` }
+        ).setImage(screenshot.url).setTimestamp();
+    
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`approve_${message.author.id}`).setLabel('✅ Одобрить').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`deny_${message.author.id}`).setLabel('❌ Отклонить').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`ask_${message.author.id}`).setLabel('💬 Уточнить').setStyle(ButtonStyle.Secondary)
     );
     
     try {
         const owner = await client.users.fetch(YOUR_USER_ID);
         await owner.send({ embeds: [embed], components: [row] });
-        
-        await message.reply('✅ **Заявка отправлена!** Ответ придёт в ЛС.');
-        userScreenshots.delete(userId);
-        
+        await message.reply('✅ Заявка отправлена!');
+        userScreenshots.delete(message.author.id);
     } catch (error) {
-        console.error('Ошибка:', error);
-        await message.reply('❌ Ошибка при отправке.');
-        userScreenshots.delete(userId);
+        await message.reply('❌ Ошибка');
+        userScreenshots.delete(message.author.id);
     }
 });
 
-// Обработка кнопок (одобрить/отклонить/уточнить)
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
-    
-    if (interaction.customId.startsWith('approve_')) {
+    if (interaction.customId === 'approve_' + interaction.customId.split('_')[1] && !interaction.customId.includes('screenshot')) {
         const userId = interaction.customId.replace('approve_', '');
-        try {
-            const user = await client.users.fetch(userId);
-            await user.send('✅ **Ваша заявка одобрена!** Деньги будут выданы в ближайшее время.');
-        } catch (e) {}
-        await interaction.reply({ content: '✅ Заявка одобрена! Уведомление отправлено.', ephemeral: true });
+        try { await (await client.users.fetch(userId)).send('✅ Заявка одобрена!'); } catch (e) {}
+        await interaction.reply({ content: '✅ Одобрено', ephemeral: true });
         await interaction.message.edit({ components: [] });
     }
-    
-    else if (interaction.customId.startsWith('deny_')) {
+    if (interaction.customId.startsWith('deny_') && !interaction.customId.includes('screenshot')) {
         const userId = interaction.customId.replace('deny_', '');
-        const modal = new ModalBuilder()
-            .setCustomId(`deny_reason_${userId}`)
-            .setTitle('❌ Причина отказа');
-        const reasonInput = new TextInputBuilder()
-            .setCustomId('reason')
-            .setLabel('Причина отказа:')
-            .setStyle(TextInputStyle.Paragraph)
-            .setPlaceholder('Напишите причину отказа...')
-            .setRequired(true);
-        const row = new ActionRowBuilder().addComponents(reasonInput);
-        modal.addComponents(row);
+        const modal = new ModalBuilder().setCustomId(`deny_reason_${userId}`).setTitle('Причина отказа');
+        modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('Причина').setStyle(TextInputStyle.Paragraph).setRequired(true)));
         await interaction.showModal(modal);
     }
-    
-    else if (interaction.customId.startsWith('ask_')) {
+    if (interaction.customId.startsWith('ask_')) {
         const userId = interaction.customId.replace('ask_', '');
-        const modal = new ModalBuilder()
-            .setCustomId(`ask_question_${userId}`)
-            .setTitle('💬 Уточнение по заявке');
-        const questionInput = new TextInputBuilder()
-            .setCustomId('question')
-            .setLabel('Вопрос пользователю:')
-            .setStyle(TextInputStyle.Paragraph)
-            .setPlaceholder('Что нужно уточнить?')
-            .setRequired(true);
-        const row = new ActionRowBuilder().addComponents(questionInput);
-        modal.addComponents(row);
+        const modal = new ModalBuilder().setCustomId(`ask_question_${userId}`).setTitle('Уточнение');
+        modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('question').setLabel('Вопрос').setStyle(TextInputStyle.Paragraph).setRequired(true)));
         await interaction.showModal(modal);
     }
 });
 
-// Обработка модалок (отказ и вопрос)
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isModalSubmit()) return;
-    
     if (interaction.customId.startsWith('deny_reason_')) {
         const userId = interaction.customId.replace('deny_reason_', '');
         const reason = interaction.fields.getTextInputValue('reason');
-        try {
-            const user = await client.users.fetch(userId);
-            await user.send(`❌ **Ваша заявка отклонена**\n\nПричина: ${reason}\n\nЕсли у вас есть вопросы, свяжитесь с администрацией.`);
-        } catch (e) {}
-        await interaction.reply({ content: '❌ Заявка отклонена! Уведомление отправлено.', ephemeral: true });
-        
-        const originalMessage = interaction.message;
-        if (originalMessage) {
-            const embed = EmbedBuilder.from(originalMessage.embeds[0]).setColor(0xFF0000);
-            await originalMessage.edit({ embeds: [embed], components: [] });
-        }
+        try { await (await client.users.fetch(userId)).send(`❌ Отказ: ${reason}`); } catch (e) {}
+        await interaction.reply({ content: '❌ Отказано', ephemeral: true });
     }
-    
-    else if (interaction.customId.startsWith('ask_question_')) {
+    if (interaction.customId.startsWith('ask_question_')) {
         const userId = interaction.customId.replace('ask_question_', '');
         const question = interaction.fields.getTextInputValue('question');
-        try {
-            const user = await client.users.fetch(userId);
-            await user.send(`💬 **Уточнение по вашей заявке**\n\n${question}\n\nПожалуйста, ответьте на это сообщение или свяжитесь с администрацией.`);
-        } catch (e) {}
-        await interaction.reply({ content: '💬 Вопрос отправлен пользователю!', ephemeral: true });
+        try { await (await client.users.fetch(userId)).send(`💬 Вопрос: ${question}`); } catch (e) {}
+        await interaction.reply({ content: '💬 Отправлено', ephemeral: true });
     }
 });
 
