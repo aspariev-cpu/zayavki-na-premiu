@@ -101,7 +101,7 @@ db.serialize(() => {
     console.log('✅ База данных инициализирована');
 });
 
-// ========== ФУНКЦИИ ДЛЯ БАЛЛОВ ==========
+// ========== ФУНКЦИИ ДЛЯ БАЛЛОВ (с поддержкой минуса) ==========
 function getUserPoints(userId, callback) {
     db.get('SELECT points FROM player_points WHERE user_id = ?', [userId], (err, row) => {
         if (err) {
@@ -113,29 +113,11 @@ function getUserPoints(userId, callback) {
     });
 }
 
+// Выдача баллов (может уходить в плюс)
 function addPoints(userId, points, username, callback) {
-    db.run(`INSERT INTO player_points (user_id, points, username) 
-            VALUES (?, ?, ?) 
-            ON CONFLICT(user_id) DO UPDATE SET 
-            points = points + ?, 
-            username = ?,
-            last_updated = CURRENT_TIMESTAMP`,
-            [userId, points, username, points, username], 
-            function(err) {
-                if (err) {
-                    console.error('Ошибка начисления баллов:', err);
-                    if (callback) callback(false);
-                } else {
-                    if (callback) callback(true);
-                    checkMilestone(userId, username);
-                }
-            });
-}
-
-function removePoints(userId, points, username, callback) {
     db.get('SELECT points FROM player_points WHERE user_id = ?', [userId], (err, row) => {
         const currentPoints = row ? row.points : 0;
-        const newPoints = Math.max(0, currentPoints - points);
+        const newPoints = currentPoints + points; // Может уходить в плюс
         
         db.run(`INSERT INTO player_points (user_id, points, username) 
                 VALUES (?, ?, ?) 
@@ -146,11 +128,42 @@ function removePoints(userId, points, username, callback) {
                 [userId, newPoints, username, newPoints, username], 
                 function(err) {
                     if (err) {
-                        console.error('Ошибка списания баллов:', err);
+                        console.error('Ошибка выдачи баллов:', err);
                         if (callback) callback(false);
                     } else {
                         if (callback) callback(true, currentPoints, newPoints);
-                        checkMilestoneDrop(userId, username, currentPoints, newPoints);
+                        // Проверяем достижение 1000 баллов
+                        if (newPoints >= 1000 && currentPoints < 1000) {
+                            checkMilestone(userId, username);
+                        }
+                    }
+                });
+    });
+}
+
+// Снятие баллов (может уходить в минус)
+function removePoints(userId, points, username, callback) {
+    db.get('SELECT points FROM player_points WHERE user_id = ?', [userId], (err, row) => {
+        const currentPoints = row ? row.points : 0;
+        const newPoints = currentPoints - points; // Может уходить в минус
+        
+        db.run(`INSERT INTO player_points (user_id, points, username) 
+                VALUES (?, ?, ?) 
+                ON CONFLICT(user_id) DO UPDATE SET 
+                points = ?, 
+                username = ?,
+                last_updated = CURRENT_TIMESTAMP`,
+                [userId, newPoints, username, newPoints, username], 
+                function(err) {
+                    if (err) {
+                        console.error('Ошибка снятия баллов:', err);
+                        if (callback) callback(false);
+                    } else {
+                        if (callback) callback(true, currentPoints, newPoints);
+                        // Проверяем падение ниже 1000 баллов
+                        if (currentPoints >= 1000 && newPoints < 1000) {
+                            checkMilestoneDrop(userId, username, currentPoints, newPoints);
+                        }
                     }
                 });
     });
@@ -313,7 +326,7 @@ function hasHighRole(member) {
     return member.roles.cache.has(HIGH_ROLE_ID);
 }
 
-// ========== СОЗДАНИЕ ПОСТОЯННЫХ КНОПОК ==========
+// ========== СОЗДАНИЕ ПОСТОЯННЫХ КНОПОК (ТРИ КНОПКИ) ==========
 async function setupGatheringButton() {
     const channel = await client.channels.fetch(CHANNEL_CREATE_GATHERING).catch(() => null);
     if (!channel) {
@@ -325,11 +338,16 @@ async function setupGatheringButton() {
     const messages = await channel.messages.fetch({ limit: 10 });
     buttonMessage = messages.find(m => m.author.id === client.user.id && m.components?.length > 0);
     
+    // ТРИ КНОПКИ в одном ряду
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
             .setCustomId('create_gathering')
             .setLabel('🎯 СОЗДАТЬ СБОР')
             .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+            .setCustomId('add_points_menu')
+            .setLabel('➕ ВЫДАТЬ БАЛЛЫ')
+            .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
             .setCustomId('remove_points_menu')
             .setLabel('📉 СНЯТЬ БАЛЛЫ')
@@ -342,9 +360,10 @@ async function setupGatheringButton() {
         .setDescription('Нажмите на кнопку ниже, чтобы выполнить действие')
         .addFields(
             { name: '🎯 СОЗДАТЬ СБОР', value: 'Создать новый сбор для начисления баллов', inline: false },
+            { name: '➕ ВЫДАТЬ БАЛЛЫ', value: 'Выдать баллы игроку (поощрение, бонус)', inline: false },
             { name: '📉 СНЯТЬ БАЛЛЫ', value: 'Списать баллы у игрока (неявка, нарушение)', inline: false }
         )
-        .setFooter({ text: 'Только для роли High' });
+        .setFooter({ text: 'Только для роли High | Баллы могут уходить в минус' });
     
     if (buttonMessage) {
         await buttonMessage.edit({ embeds: [embed], components: [row] });
@@ -361,6 +380,7 @@ client.once('ready', () => {
     console.log(`📨 Заявки на финансирование → <@${YOUR_USER_ID}>`);
     console.log(`💰 Максимальная сумма: 100 000 ₽`);
     console.log(`🎮 Система сборов активна!`);
+    console.log(`📊 Баллы могут уходить в минус`);
     loadBlacklist();
     setupGatheringButton();
 });
@@ -482,7 +502,7 @@ client.on('messageCreate', async (message) => {
             if (err || rows.length === 0) {
                 const reply = await message.reply(`📋 История для <@${userId}> пуста.`);
                 setTimeout(() => reply.delete().catch(() => {}), 10000);
-                return message.delete().catch(() => {});
+                return;
             }
             
             let description = '';
@@ -498,14 +518,12 @@ client.on('messageCreate', async (message) => {
                 .setDescription(description)
                 .setFooter({ text: 'Последние 10 изменений' });
             
-            const reply = await message.reply({ embeds: [embed] });
-            setTimeout(() => reply.delete().catch(() => {}), 30000);
-            message.delete().catch(() => {});
+            await message.reply({ embeds: [embed] });
         });
     }
 });
 
-// ========== СОЗДАНИЕ СБОРА ==========
+// ========== СОЗДАНИЕ СБОРА (БЕЗ ЛИМИТА) ==========
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
     if (interaction.customId === 'create_gathering') {
@@ -533,29 +551,27 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: '❌ Баллы должны быть положительным числом!', ephemeral: true });
     }
     
-    db.get('SELECT COUNT(*) as count FROM gatherings WHERE is_active = 1', (err, row) => {
-        if (row && row.count >= 5) {
-            return interaction.reply({ content: '❌ Лимит активных сборов (5)', ephemeral: true });
+    // БЕЗ ЛИМИТА - создаём сбор сразу
+    db.run(`INSERT INTO gatherings (title, points, organizer_id, is_active) VALUES (?, ?, ?, 1)`, [title, points, interaction.user.id], async function(err) {
+        if (err) {
+            console.error('Ошибка создания сбора:', err);
+            return interaction.reply({ content: '❌ Ошибка при создании сбора', ephemeral: true });
         }
         
-        db.run(`INSERT INTO gatherings (title, points, organizer_id, is_active) VALUES (?, ?, ?, 1)`, [title, points, interaction.user.id], async function(err) {
-            if (err) return interaction.reply({ content: '❌ Ошибка', ephemeral: true });
-            
-            const gatherId = this.lastID;
-            const announceChannel = await client.channels.fetch(CHANNEL_GATHERING_ANNOUNCE);
-            const rowBtn = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`submit_screenshot_${gatherId}`).setLabel('📸 ПРИКРЕПИТЬ СКРИН').setStyle(ButtonStyle.Primary)
-            );
-            const embed = new EmbedBuilder().setTitle('🎯 НОВЫЙ СБОР').setColor(0x00FF00).setDescription(`**${title}**`).addFields(
-                { name: '🏆 Награда', value: `${points} баллов`, inline: true },
-                { name: '👤 Организатор', value: `<@${interaction.user.id}>`, inline: true },
-                { name: '📌 Как участвовать', value: 'Нажмите кнопку и отправьте скрин в ЛС', inline: false }
-            ).setFooter({ text: `ID: ${gatherId}` }).setTimestamp();
-            
-            const sentMessage = await announceChannel.send({ content: `@everyone`, embeds: [embed], components: [rowBtn] });
-            db.run('UPDATE gatherings SET message_id = ?, channel_id = ? WHERE id = ?', [sentMessage.id, CHANNEL_GATHERING_ANNOUNCE, gatherId]);
-            await interaction.reply({ content: `✅ Сбор "${title}" создан!`, ephemeral: true });
-        });
+        const gatherId = this.lastID;
+        const announceChannel = await client.channels.fetch(CHANNEL_GATHERING_ANNOUNCE);
+        const rowBtn = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`submit_screenshot_${gatherId}`).setLabel('📸 ПРИКРЕПИТЬ СКРИН').setStyle(ButtonStyle.Primary)
+        );
+        const embed = new EmbedBuilder().setTitle('🎯 НОВЫЙ СБОР').setColor(0x00FF00).setDescription(`**${title}**`).addFields(
+            { name: '🏆 Награда', value: `${points} баллов`, inline: true },
+            { name: '👤 Организатор', value: `<@${interaction.user.id}>`, inline: true },
+            { name: '📌 Как участвовать', value: 'Нажмите кнопку и отправьте скрин в ЛС', inline: false }
+        ).setFooter({ text: `ID: ${gatherId}` }).setTimestamp();
+        
+        const sentMessage = await announceChannel.send({ content: `@everyone`, embeds: [embed], components: [rowBtn] });
+        db.run('UPDATE gatherings SET message_id = ?, channel_id = ? WHERE id = ?', [sentMessage.id, CHANNEL_GATHERING_ANNOUNCE, gatherId]);
+        await interaction.reply({ content: `✅ Сбор "${title}" создан!`, ephemeral: true });
     });
 });
 
@@ -643,6 +659,71 @@ client.on('messageCreate', async (message) => {
     });
 });
 
+// ========== ВЫДАЧА БАЛЛОВ ЧЕРЕЗ КНОПКУ ==========
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (interaction.customId === 'add_points_menu') {
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+        if (!hasHighRole(member)) {
+            return interaction.reply({ content: `❌ Требуется роль <@&${HIGH_ROLE_ID}>`, ephemeral: true });
+        }
+        
+        const modal = new ModalBuilder().setCustomId(`add_points_modal_${interaction.user.id}`).setTitle('➕ Выдача баллов');
+        const userInput = new TextInputBuilder().setCustomId('user_id').setLabel('Пользователь (@ или ID)').setStyle(TextInputStyle.Short).setPlaceholder('@Вася').setRequired(true);
+        const pointsInput = new TextInputBuilder().setCustomId('points').setLabel('Сколько баллов выдать?').setStyle(TextInputStyle.Short).setPlaceholder('50').setRequired(true);
+        const reasonInput = new TextInputBuilder().setCustomId('reason').setLabel('Причина').setStyle(TextInputStyle.Paragraph).setPlaceholder('За участие в мероприятии').setRequired(true);
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(userInput),
+            new ActionRowBuilder().addComponents(pointsInput),
+            new ActionRowBuilder().addComponents(reasonInput)
+        );
+        await interaction.showModal(modal);
+    }
+});
+
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isModalSubmit()) return;
+    if (!interaction.customId.startsWith('add_points_modal_')) return;
+    
+    const userInput = interaction.fields.getTextInputValue('user_id');
+    const points = parseInt(interaction.fields.getTextInputValue('points'));
+    const reason = interaction.fields.getTextInputValue('reason');
+    
+    let userId = userInput.replace(/[<@!>]/g, '').trim();
+    if (!userId.match(/^\d+$/)) {
+        return interaction.reply({ content: '❌ Укажите корректного пользователя', ephemeral: true });
+    }
+    
+    if (isNaN(points) || points <= 0) {
+        return interaction.reply({ content: '❌ Баллы должны быть положительным числом', ephemeral: true });
+    }
+    
+    let targetUser;
+    try {
+        targetUser = await client.users.fetch(userId);
+    } catch (e) {
+        return interaction.reply({ content: '❌ Пользователь не найден', ephemeral: true });
+    }
+    
+    db.get('SELECT points FROM player_points WHERE user_id = ?', [userId], async (err, row) => {
+        const currentPoints = row ? row.points : 0;
+        
+        addPoints(userId, points, targetUser.tag, async (success, oldPoints, newPoints) => {
+            if (success) {
+                logPointsHistory(userId, points, newPoints, reason, interaction.user.id);
+                
+                try {
+                    await targetUser.send(`✅ **Вам начислено ${points} баллов!**\n📝 Причина: ${reason}\n📊 ${oldPoints} → ${newPoints} баллов`);
+                } catch (e) {}
+                
+                await interaction.reply({ content: `✅ Выдано ${points} баллов ${targetUser.tag}\n${oldPoints} → ${newPoints} баллов`, ephemeral: true });
+            } else {
+                await interaction.reply({ content: '❌ Ошибка при выдаче баллов', ephemeral: true });
+            }
+        });
+    });
+});
+
 // ========== СНЯТИЕ БАЛЛОВ ЧЕРЕЗ КНОПКУ ==========
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
@@ -691,21 +772,18 @@ client.on('interactionCreate', async (interaction) => {
     
     db.get('SELECT points FROM player_points WHERE user_id = ?', [userId], async (err, row) => {
         const currentPoints = row ? row.points : 0;
-        if (currentPoints === 0) {
-            return interaction.reply({ content: `⚠️ У ${targetUser.tag} 0 баллов`, ephemeral: true });
-        }
         
         removePoints(userId, points, targetUser.tag, async (success, oldPoints, newPoints) => {
             if (success) {
                 logPointsHistory(userId, -points, newPoints, reason, interaction.user.id);
                 
                 try {
-                    await targetUser.send(`⚠️ **Снято ${points} баллов**\n📝 Причина: ${reason}\n📊 ${oldPoints} → ${newPoints}`);
+                    await targetUser.send(`⚠️ **Снято ${points} баллов**\n📝 Причина: ${reason}\n📊 ${oldPoints} → ${newPoints} баллов`);
                 } catch (e) {}
                 
-                await interaction.reply({ content: `✅ Снято ${points} баллов у ${targetUser.tag}\n${oldPoints} → ${newPoints}`, ephemeral: true });
+                await interaction.reply({ content: `✅ Снято ${points} баллов у ${targetUser.tag}\n${oldPoints} → ${newPoints} баллов`, ephemeral: true });
             } else {
-                await interaction.reply({ content: '❌ Ошибка', ephemeral: true });
+                await interaction.reply({ content: '❌ Ошибка при снятии баллов', ephemeral: true });
             }
         });
     });
